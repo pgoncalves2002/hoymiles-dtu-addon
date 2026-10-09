@@ -1,0 +1,23 @@
+name: Hoymiles DTU API
+version: "1.0.0"
+slug: hoymiles_dtu_api
+description: Captura os dados do DTU Hoymiles na rede local e os expõe em uma API REST (JSON)
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: API REST (JSON)
+watchdog: http://[HOST]:[PORT:8099]/health
+options:
+  dtu_host: "192.168.0.34"
+  poll_interval: 5
+  timeout: 5
+schema:
+  dtu_host: str
+  poll_interval: int(2,3600)
+  timeout: int(1,60)
