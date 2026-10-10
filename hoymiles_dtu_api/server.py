@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,7 +36,7 @@ INTERNAL_NETS = [ipaddress.ip_network(n) for n in ("172.30.32.0/23", "172.30.232
 AUTO_SCAN_EVERY = 600  # s entre buscas automaticas enquanto o DTU nao responde
 HEADER_FIELDS = 12                   # campos antes da lista de paineis
 ROW_FIELDS = 8                       # campos por painel
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 # IP ou nome na rede, com porta opcional: 192.168.0.34 | dtu.lan | 192.168.0.34:8080
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$")
 
@@ -43,7 +44,8 @@ HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?(?::\d{1
 # ----------------------------------------------------------------- config --
 def load_options():
     opts = {"dtu_host": "192.168.0.34", "poll_interval": 5, "timeout": 5,
-            "auto_discover": True, "mqtt_enabled": True}
+            "auto_discover": True, "mqtt_enabled": True,
+            "power_zero_threshold_w": 0}
     try:
         with open(OPTIONS_FILE, encoding="utf-8") as fh:
             opts.update(json.load(fh))
@@ -63,6 +65,12 @@ def load_options():
         opts["mqtt_enabled"] = os.environ["MQTT_ENABLED"].lower() in ("1", "true", "sim", "yes")
     if os.environ.get("AUTO_DISCOVER"):
         opts["auto_discover"] = os.environ["AUTO_DISCOVER"].lower() in ("1", "true", "sim", "yes")
+    if os.environ.get("POWER_ZERO_THRESHOLD_W"):
+        opts["power_zero_threshold_w"] = os.environ["POWER_ZERO_THRESHOLD_W"]
+    try:
+        opts["power_zero_threshold_w"] = max(0.0, float(opts.get("power_zero_threshold_w") or 0))
+    except (TypeError, ValueError):
+        opts["power_zero_threshold_w"] = 0.0
     opts["port"] = int(os.environ.get("PORT", 8099))
     return opts
 
@@ -825,6 +833,7 @@ ENDPOINTS = {
     "/api/refresh": "POST: le o DTU agora e devolve a leitura (para testes)",
     "/api/discover": "POST: procura DTUs na rede do Home Assistant (~5-15 s)",
     "/health": "estado do coletor",
+    "?raw=1": "em /api/status, /api/summary e /api/refresh: ignora o corte de potencia",
 }
 
 MAX_BODY = 4096
@@ -1108,7 +1117,7 @@ function render(meta, data) {
 
 async function refresh() {
   try {
-    const st = await getJson("api/status");
+    const st = await getJson("api/status?raw=1");
     if (st.status === 200) render(st.body.meta, st.body);
     else render(st.body.meta || (await getJson("health")).body, null);
   } catch (e) {
@@ -1119,7 +1128,7 @@ async function refresh() {
 $("readnow").addEventListener("click", async () => {
   const b = $("readnow"); b.disabled = true; b.textContent = "Lendo…";
   try {
-    const r = await getJson("api/refresh", { method: "POST" });
+    const r = await getJson("api/refresh?raw=1", { method: "POST" });
     render(r.body.meta, r.body.summary ? r.body : null);
     b.textContent = r.status === 200 ? "Lido ✓" : "Falhou";
   } catch (e) { b.textContent = "Falhou"; }
@@ -1295,6 +1304,19 @@ loadConfig().catch(() => {}); refresh(); setInterval(refresh, 5000);
 """
 
 
+def apply_power_cutoff(summary, threshold_w):
+    """Copia do resumo com a potencia total zerada quando abaixo do corte.
+
+    Vale so para as respostas da API pedidas por outros sistemas: a leitura
+    guardada no coletor, o painel do add-on e os sensores MQTT nao mudam.
+    """
+    out = dict(summary)
+    total_kw = out.get("p_total_kw")
+    if threshold_w > 0 and total_kw is not None and total_kw * 1000 < threshold_w:
+        out["p_total_kw"] = 0.0
+    return out
+
+
 def make_handler(collector):
     config_lock = threading.Lock()  # uma troca de IP por vez
 
@@ -1317,6 +1339,16 @@ def make_handler(collector):
 
         def _path(self):
             return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+        def _cutoff(self):
+            """Corte de potencia (W) desta requisicao; ?raw=1 desliga."""
+            query = urllib.parse.parse_qs(self.path.partition("?")[2])
+            if query.get("raw", ["0"])[0].lower() in ("1", "true"):
+                return 0.0
+            try:
+                return max(0.0, float(collector.extra_options.get("power_zero_threshold_w") or 0))
+            except (TypeError, ValueError):
+                return 0.0
 
         def _config(self):
             return {**collector.options(),
@@ -1354,10 +1386,13 @@ def make_handler(collector):
             if data is None:
                 return self._send(503, {"error": "ainda sem leitura do DTU", "meta": meta})
 
+            cutoff = self._cutoff()
+            meta["power_zero_threshold_w"] = cutoff
+            summary = apply_power_cutoff(data["summary"], cutoff)
             if path == "/api/status":
-                return self._send(200, {"meta": meta, **data})
+                return self._send(200, {"meta": meta, **data, "summary": summary})
             if path == "/api/summary":
-                return self._send(200, {"meta": meta, "summary": data["summary"]})
+                return self._send(200, {"meta": meta, "summary": summary})
             if path == "/api/panels":
                 return self._send(200, {"meta": meta, "panels": data["panels"]})
             if path == "/api/inverters":
@@ -1377,6 +1412,10 @@ def make_handler(collector):
                 collector.poll_once()
                 data, meta = collector.snapshot()
                 code = 200 if meta["last_error"] is None and data is not None else 502
+                cutoff = self._cutoff()
+                meta["power_zero_threshold_w"] = cutoff
+                if data:
+                    data = {**data, "summary": apply_power_cutoff(data["summary"], cutoff)}
                 return self._send(code, {"meta": meta, **(data or {})})
             if self._path() != "/api/config":
                 return self._send(404, {"error": "rota nao encontrada", "endpoints": ENDPOINTS})
@@ -1442,9 +1481,11 @@ def main():
     threading.Thread(target=collector.run_forever, daemon=True).start()
     collector.mqtt.start()
     server = ThreadingHTTPServer(("0.0.0.0", opts["port"]), make_handler(collector))
-    print("[api] v%s - DTU em %s, coleta a cada %ss, busca automatica %s, porta %s"
+    print("[api] v%s - DTU em %s, coleta a cada %ss, busca automatica %s, "
+          "corte de potencia %s W, porta %s"
           % (VERSION, opts["dtu_host"], collector.interval,
-             "ligada" if collector.auto_discover else "desligada", opts["port"]), flush=True)
+             "ligada" if collector.auto_discover else "desligada",
+             opts["power_zero_threshold_w"], opts["port"]), flush=True)
     server.serve_forever()
 
 

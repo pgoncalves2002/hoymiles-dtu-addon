@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0
+
+- Nova opção `power_zero_threshold_w`: potência total abaixo desse valor (em
+  watts) sai como 0 nas respostas da API (`/api/status`, `/api/summary` e
+  `POST /api/refresh`). O painel do add-on e os sensores MQTT continuam com o
+  valor real; `?raw=1` devolve o valor real também pela API.
+
 ## 1.3.0
 
 - Sensores no Home Assistant via MQTT Discovery, usando o Mosquitto do HA

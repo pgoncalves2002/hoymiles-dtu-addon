@@ -46,7 +46,26 @@ O mesmo painel abre em `http://<ip-do-home-assistant>:8099/` no navegador.
 | `mqtt_enabled`  | `true`         | Publica os sensores no MQTT do Home Assistant (veja abaixo) |
 | `mqtt_host` etc.| —              | Opcionais: broker manual (`mqtt_host`, `mqtt_port`, `mqtt_user`, `mqtt_password`). Vazios = usa o Mosquitto do HA |
 
+| `power_zero_threshold_w` | `0`   | Corte de potência da API, em watts (0 desliga) — veja abaixo |
+
 A porta externa (8099) pode ser trocada na seção **Rede** do add-on.
+
+### Corte de potência da API
+
+Com `power_zero_threshold_w` maior que zero, as respostas de `/api/status`,
+`/api/summary` e `POST /api/refresh` trazem `p_total_kw: 0.0` sempre que a
+potência total do sistema estiver abaixo desse valor. Exemplo: com `50`, uma
+leitura de 0,03 kW (30 W) sai como 0.
+
+- Só a potência total é afetada; os valores de cada painel solar, a energia do
+  dia e a energia total não mudam.
+- O painel do add-on (abas **Coleta** e **Painéis**) e os sensores MQTT
+  continuam com o valor real. A aba **Testar API** mostra a resposta com o
+  corte, igual à que o seu sistema recebe.
+- Para pedir o valor real pela API, acrescente `?raw=1`, por exemplo
+  `/api/summary?raw=1`.
+- `meta.power_zero_threshold_w` mostra o corte usado em cada resposta.
+- O DTU informa o total em kW com duas casas, ou seja, em passos de 10 W.
 
 ## Sensores no Home Assistant (MQTT) e painel Energia
 

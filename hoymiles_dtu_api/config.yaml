@@ -1,5 +1,5 @@
 name: Hoymiles DTU API
-version: "1.3.0"
+version: "1.4.0"
 slug: hoymiles_dtu_api
 description: Captura os dados do DTU Hoymiles na rede local e os expõe em uma API REST (JSON)
 arch:
@@ -29,12 +29,14 @@ options:
   timeout: 5
   auto_discover: true
   mqtt_enabled: true
+  power_zero_threshold_w: 0
 schema:
   dtu_host: str
   poll_interval: int(2,3600)
   timeout: int(1,60)
   auto_discover: bool
   mqtt_enabled: bool
+  power_zero_threshold_w: float(0,1000000)
   mqtt_host: str?
   mqtt_port: port?
   mqtt_user: str?
