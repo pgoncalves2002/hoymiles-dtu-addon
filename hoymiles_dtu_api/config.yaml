@@ -1,5 +1,5 @@
 name: Hoymiles DTU API
-version: "1.0.0"
+version: "1.1.0"
 slug: hoymiles_dtu_api
 description: Captura os dados do DTU Hoymiles na rede local e os expõe em uma API REST (JSON)
 arch:
@@ -8,6 +8,13 @@ arch:
 init: false
 startup: services
 boot: auto
+# painel na barra lateral do HA para ver o estado e trocar o IP do DTU
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:solar-power
+panel_title: DTU Hoymiles
+# permite salvar o novo IP nas opcoes do add-on
+hassio_api: true
 ports:
   8099/tcp: 8099
 ports_description:
