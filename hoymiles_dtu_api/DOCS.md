@@ -27,7 +27,11 @@ Serve para conferir a coleta antes de ligar a API no seu sistema:
 - **Painéis**: tabela com todos os painéis, agrupados por microinversor.
 - **Testar API**: escolha uma rota, veja a resposta JSON, o código HTTP e o
   tempo, e copie a URL (ou o comando `curl`) que o seu sistema deve chamar.
-- **IP do DTU**: troca o IP consultado (veja abaixo).
+- **IP do DTU**: troca o IP consultado e **procura o DTU na rede** (veja abaixo).
+
+Quando a leitura falha, a aba **Coleta** mostra um aviso com o motivo provável
+(por exemplo, "nenhum aparelho respondeu nesse IP" ou "o IP existe, mas não
+parece ser o DTU") e um botão para procurar o DTU na rede.
 
 O mesmo painel abre em `http://<ip-do-home-assistant>:8099/` no navegador.
 
@@ -38,6 +42,7 @@ O mesmo painel abre em `http://<ip-do-home-assistant>:8099/` no navegador.
 | `dtu_host`      | `192.168.0.34` | IP (ou IP:porta) do DTU — dá para trocar sem reiniciar, veja abaixo |
 | `poll_interval` | `5`            | Segundos entre leituras do DTU              |
 | `timeout`       | `5`            | Tempo máximo de espera pela resposta do DTU |
+| `auto_discover` | `true`         | Se o DTU parar de responder, procura na rede e troca de IP sozinho |
 
 A porta externa (8099) pode ser trocada na seção **Rede** do add-on.
 
@@ -51,6 +56,23 @@ add-on. Há três jeitos, todos com o mesmo efeito:
    digite o novo IP e clique em **Salvar**.
 2. **API**: `POST /api/config` com `{"dtu_host": "192.168.0.40"}`.
 3. **Dashboard/automação**: com o `rest_command` do exemplo abaixo.
+
+### Não sei o IP do DTU / o IP mudou
+
+Na aba **IP do DTU**, clique em **Procurar**: o add-on testa todos os IPs da
+rede do Home Assistant (as redes /24 das interfaces do HA e a do IP atual) e
+lista os DTUs encontrados, com potência e energia, e um botão **Usar este IP**.
+A busca leva de 5 a 15 segundos. Também dá para chamar `POST /api/discover`.
+
+Com `auto_discover` ligado (padrão), isso acontece sozinho: depois de 3
+leituras seguidas com falha, o add-on procura na rede (no máximo uma vez a cada
+10 minutos) e, se achar **exatamente um** DTU em outro IP, troca para ele e
+salva na configuração. Com dois ou mais DTUs na rede, ele não escolhe; use o
+painel. Para o IP não mudar mais, reserve um IP fixo para o DTU no roteador
+(reserva DHCP).
+
+Se a busca não achar nada: o DTU precisa estar ligado e na mesma rede do Home
+Assistant. A busca só cobre redes /24 (até 254 IPs cada).
 
 Antes de trocar, o add-on testa o novo endereço. Se o DTU não responder ali,
 a troca é recusada (HTTP 502) e a coleta continua no IP antigo — para trocar
@@ -101,6 +123,7 @@ Base: `http://<ip-do-home-assistant>:8099`
 | `/api/inverters`    | Painéis agrupados por microinversor                  |
 | `/api/config`       | `GET`: configuração atual · `POST`: troca o IP do DTU |
 | `/api/refresh`      | `POST`: lê o DTU na hora e devolve a leitura completa |
+| `/api/discover`     | `POST`: procura DTUs na rede (~5-15 s)               |
 | `/health`           | Estado do coletor                                    |
 
 Exemplo de `/api/summary`:
@@ -168,6 +191,11 @@ Cada painel traz `id`, `inverter_serial`, `port`, `v_pv` (V), `v_grid` (V),
 - Em `/`, navegadores recebem o painel; clientes que não pedem HTML recebem
   a lista de rotas em JSON.
 - `meta.fetch_ms` é quanto o DTU levou para responder na última leitura boa.
+- `meta.last_error_hint` traduz o último erro em um motivo provável;
+  `meta.consecutive_failures` conta as falhas seguidas e `meta.last_auto_scan`
+  traz o resultado da última busca automática.
+- Uma resposta que não tem o formato do DTU (página de roteador, por exemplo) é
+  tratada como erro, não como leitura.
 
 ## Rodar fora do Home Assistant
 

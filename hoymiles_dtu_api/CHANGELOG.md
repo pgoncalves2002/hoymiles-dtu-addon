@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- Busca do DTU na rede: botão **Procurar** no painel e `POST /api/discover`.
+- `auto_discover` (ligado por padrão): se o DTU parar de responder, o add-on
+  procura na rede e troca de IP sozinho quando acha um único DTU.
+- Erros com motivo provável (`meta.last_error_hint`) e aviso na aba Coleta.
+- Leitura mais tolerante ao servidor web simplificado do DTU (resposta sem
+  cabeçalhos HTTP ou conexão encerrada cedo).
+- Respostas fora do formato do DTU (ex.: página do roteador) passam a ser erro.
+
 ## 1.1.0
 
 - Troca do IP do DTU pelo Home Assistant, sem reiniciar o add-on: painel

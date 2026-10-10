@@ -10,10 +10,14 @@ Supervisor, entao vale tambem depois de reiniciar.
 
 Sem dependencias externas: apenas biblioteca padrao do Python 3.
 """
+import concurrent.futures
+import errno
 import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -24,16 +28,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 OPTIONS_FILE = "/data/options.json"  # gerado pelo Home Assistant Supervisor
 SUPERVISOR_OPTIONS_URL = "http://supervisor/addons/self/options"
 SUPERVISOR_INFO_URL = "http://supervisor/addons/self/info"
+SUPERVISOR_NETWORK_URL = "http://supervisor/network/info"
+# redes internas do Supervisor/Docker: nunca entram na busca
+INTERNAL_NETS = [ipaddress.ip_network(n) for n in ("172.30.32.0/23", "172.30.232.0/23")]
+AUTO_SCAN_EVERY = 600  # s entre buscas automaticas enquanto o DTU nao responde
 HEADER_FIELDS = 12                   # campos antes da lista de paineis
 ROW_FIELDS = 8                       # campos por painel
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 # IP ou nome na rede, com porta opcional: 192.168.0.34 | dtu.lan | 192.168.0.34:8080
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$")
 
 
 # ----------------------------------------------------------------- config --
 def load_options():
-    opts = {"dtu_host": "192.168.0.34", "poll_interval": 5, "timeout": 5}
+    opts = {"dtu_host": "192.168.0.34", "poll_interval": 5, "timeout": 5,
+            "auto_discover": True}
     try:
         with open(OPTIONS_FILE, encoding="utf-8") as fh:
             opts.update(json.load(fh))
@@ -46,6 +55,8 @@ def load_options():
         opts["poll_interval"] = int(os.environ["POLL_INTERVAL"])
     if os.environ.get("TIMEOUT"):
         opts["timeout"] = int(os.environ["TIMEOUT"])
+    if os.environ.get("AUTO_DISCOVER"):
+        opts["auto_discover"] = os.environ["AUTO_DISCOVER"].lower() in ("1", "true", "sim", "yes")
     opts["port"] = int(os.environ.get("PORT", 8099))
     return opts
 
@@ -213,6 +224,36 @@ def parse_hometable(text):
 
 
 # ------------------------------------------------------------------ coleta --
+def _fetch_raw(host, timeout):
+    """GET minimo por socket, para servidores embarcados que o http.client recusa
+    (sem linha de status, cabecalhos malformados, conexao fechada cedo)."""
+    name, _, port = host.partition(":")
+    request = ("GET /hometable.xml HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n"
+               % host).encode("ascii")
+    chunks = []
+    with socket.create_connection((name, int(port or 80)), timeout=timeout) as sock:
+        sock.sendall(request)
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                if chunks:  # alguns DTUs nao fecham a conexao: fica com o que chegou
+                    break
+                raise
+            if not chunk:
+                break
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    if raw.startswith(b"HTTP/"):
+        head, _, raw = raw.partition(b"\r\n\r\n")
+        status = head.split(b"\r\n", 1)[0].split(b" ")
+        code = int(status[1]) if len(status) > 1 and status[1].isdigit() else 0
+        if code != 200:
+            raise urllib.error.HTTPError("http://%s/hometable.xml" % host, code,
+                                         "HTTP %d" % code, None, None)
+    return raw
+
+
 def fetch_hometable(host, timeout):
     url = "http://%s/hometable.xml?_t=%d" % (host, int(time.time() * 1000))
     try:
@@ -220,20 +261,142 @@ def fetch_hometable(host, timeout):
             raw = resp.read()
     except http.client.IncompleteRead as exc:  # servidor embarcado simples
         raw = exc.partial
+    except http.client.HTTPException:  # BadStatusLine, LineTooLong...
+        raw = _fetch_raw(host, timeout)
+    except urllib.error.URLError as exc:
+        if isinstance(exc, urllib.error.HTTPError) or not isinstance(
+                exc.reason, (http.client.RemoteDisconnected, ConnectionResetError)):
+            raise
+        raw = _fetch_raw(host, timeout)
     return raw.decode("latin-1")
 
 
+def explain_error(exc, timeout):
+    """Traduz a excecao da leitura em uma dica do que provavelmente aconteceu."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return ("o aparelho nesse IP respondeu, mas não tem /hometable.xml: "
+                    "provavelmente não é o DTU")
+        return "o aparelho nesse IP respondeu com erro HTTP %d" % exc.code
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return "nome não encontrado na rede (DNS)"
+    if isinstance(reason, TimeoutError):  # inclui socket.timeout
+        return ("ninguém respondeu em %ds: IP errado, DTU fora do Wi-Fi ou desligado"
+                % timeout)
+    if isinstance(reason, ConnectionRefusedError):
+        return "o IP existe, mas recusou a conexão na porta 80: não parece ser o DTU"
+    if isinstance(reason, OSError) and reason.errno in (
+            errno.EHOSTUNREACH, errno.EHOSTDOWN, errno.ENETUNREACH):
+        return ("nenhum aparelho respondeu nesse IP: IP errado (mudou?) ou DTU fora "
+                "da rede")
+    if isinstance(exc, ValueError):
+        return "o aparelho respondeu, mas a resposta não tem o formato do DTU"
+    return None
+
+
+def parse_dtu(text):
+    """parse_hometable com verificacao: recusa resposta de outro aparelho
+    (pagina de roteador etc.) que por acaso tenha ';' suficientes."""
+    head = text.split("\x00", 1)[0]
+    if "<" in head[:200]:  # HTML/XML de verdade nao e o formato do DTU
+        raise ValueError("a resposta é uma página HTML, não o formato do DTU")
+    data = parse_hometable(head)
+    s = data["summary"]
+    if None in (s["p_total_kw"], s["e_total_kwh"], s["e_today_kwh"]):
+        raise ValueError("a resposta não tem o formato do DTU")
+    return data
+
+
+# ------------------------------------------------------------------- busca --
+def _scan_subnets(current_host):
+    """Redes /24 onde procurar: as do Home Assistant (via Supervisor) e a do IP atual."""
+    nets = []
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if token:
+        req = urllib.request.Request(SUPERVISOR_NETWORK_URL,
+                                     headers={"Authorization": "Bearer " + token})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                interfaces = json.loads(resp.read()).get("data", {}).get("interfaces") or []
+            for iface in interfaces:
+                if iface.get("enabled") is False or iface.get("connected") is False:
+                    continue
+                for addr in (iface.get("ipv4") or {}).get("address") or []:
+                    itf = ipaddress.ip_interface(addr)
+                    nets.append(ipaddress.ip_network("%s/%d" % (
+                        itf.ip, max(24, itf.network.prefixlen)), strict=False))
+        except Exception as exc:  # noqa: BLE001
+            print("[busca] nao consegui ler as redes no Supervisor: %s" % exc, flush=True)
+    try:
+        ip = ipaddress.ip_address(current_host.split(":", 1)[0])
+        nets.append(ipaddress.ip_network("%s/24" % ip, strict=False))
+    except ValueError:
+        pass  # dtu_host e um nome, nao um IP
+    seen, result = set(), []
+    for net in nets:
+        if (net.version == 4 and net.is_private and net not in seen
+                and not any(net.overlaps(n) for n in INTERNAL_NETS)):
+            seen.add(net)
+            result.append(net)
+    return result[:4]
+
+
+def _probe(ip, timeout):
+    try:  # filtro rapido: so faz a leitura onde a porta 80 esta aberta
+        with socket.create_connection((ip, 80), timeout=1.5):
+            pass
+    except OSError:
+        return None
+    try:
+        data = parse_dtu(fetch_hometable(ip, timeout))
+    except Exception:  # noqa: BLE001
+        return None
+    s = data["summary"]
+    return {"host": ip, "panel_count": s["panel_count"], "panels_online": s["panels_online"],
+            "p_total_kw": s["p_total_kw"], "e_total_kwh": s["e_total_kwh"]}
+
+
+_scan_lock = threading.Lock()
+
+
+def scan_for_dtus(current_host, timeout):
+    """Procura DTUs nas redes do Home Assistant. Leva ~5-15 s."""
+    with _scan_lock:
+        started = time.time()
+        nets = _scan_subnets(current_host)
+        hosts = [str(h) for net in nets for h in net.hosts()]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            found = [r for r in pool.map(lambda h: _probe(h, timeout), hosts) if r]
+        result = {
+            "subnets": [str(n) for n in nets],
+            "scanned": len(hosts),
+            "elapsed_s": round(time.time() - started, 1),
+            "found": found,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        print("[busca] %d IPs em %s: %s" % (len(hosts), ", ".join(result["subnets"]) or "-",
+              ", ".join(f["host"] for f in found) or "nenhum DTU"), flush=True)
+        return result
+
+
+# ------------------------------------------------------------------ coletor --
 class Collector:
-    def __init__(self, host, interval, timeout):
+    def __init__(self, host, interval, timeout, auto_discover=True):
         self.host = host
         self.interval = max(1, int(interval))
         self.timeout = int(timeout)
+        self.auto_discover = bool(auto_discover)
         self._lock = threading.Lock()
         self._data = None
         self._fetched_at = None
         self._last_error = None
+        self._last_hint = None
+        self._failures = 0
         self._last_attempt = None
         self._fetch_ms = None
+        self._last_scan_at = 0.0
+        self._auto_scan = None  # resultado da ultima busca automatica
 
     @property
     def url(self):
@@ -242,7 +405,7 @@ class Collector:
     def options(self):
         """Opcoes no formato do schema do add-on (config.yaml)."""
         return {"dtu_host": self.host, "poll_interval": self.interval,
-                "timeout": self.timeout}
+                "timeout": self.timeout, "auto_discover": self.auto_discover}
 
     def set_host(self, host, data=None):
         """Troca o DTU consultado sem reiniciar.
@@ -254,7 +417,8 @@ class Collector:
             old, self.host = self.host, host
             self._data = data
             self._fetched_at = time.time() if data is not None else None
-            self._last_error = None
+            self._last_error = self._last_hint = None
+            self._failures = 0
         print("[coletor] DTU trocado: %s -> %s" % (old, host), flush=True)
 
     def poll_once(self):
@@ -262,32 +426,72 @@ class Collector:
         with self._lock:
             host = self.host
         try:
-            data = parse_hometable(fetch_hometable(host, self.timeout))
+            data = parse_dtu(fetch_hometable(host, self.timeout))
             with self._lock:
                 if host != self.host:  # o IP mudou durante a leitura
                     return
-                self._data, self._fetched_at, self._last_error = data, now, None
+                self._data, self._fetched_at = data, now
+                self._last_error = self._last_hint = None
+                self._failures = 0
                 self._fetch_ms = round((time.time() - now) * 1000)
         except Exception as exc:  # noqa: BLE001 - mantem a ultima leitura boa
+            hint = explain_error(exc, self.timeout)
             with self._lock:
                 if host != self.host:
                     return
                 self._last_error = "%s: %s" % (type(exc).__name__, exc)
-            print("[coletor] falha ao ler %s: %s" % (host, exc), flush=True)
+                self._last_hint = hint
+                self._failures += 1
+            print("[coletor] falha ao ler %s: %s%s" % (host, exc, " (%s)" % hint if hint else ""),
+                  flush=True)
         finally:
             with self._lock:
                 self._last_attempt = now
+
+    def _maybe_auto_discover(self):
+        """Se o DTU sumiu (3 falhas seguidas), procura na rede e troca de IP sozinho.
+
+        Faz no maximo uma busca a cada AUTO_SCAN_EVERY segundos; so troca quando
+        acha exatamente um DTU, para nao escolher errado com dois na rede.
+        """
+        with self._lock:
+            due = (self.auto_discover and self._failures >= 3
+                   and time.time() - self._last_scan_at >= AUTO_SCAN_EVERY)
+            host = self.host
+        if not due:
+            return
+        self._last_scan_at = time.time()
+        print("[busca] DTU sem responder em %s; procurando na rede..." % host, flush=True)
+        result = scan_for_dtus(host, self.timeout)
+        others = [f for f in result["found"] if f["host"] != host]
+        result["switched_to"] = None
+        if len(result["found"]) == 1 and others:
+            new = others[0]["host"]
+            self.set_host(new)
+            ok, err = persist_options(self.options())
+            result["switched_to"] = new
+            print("[busca] trocado automaticamente para %s%s" % (
+                new, "" if ok else " (nao salvo nas opcoes: %s)" % err), flush=True)
+            self.poll_once()
+        elif len(result["found"]) > 1:
+            print("[busca] mais de um DTU encontrado; escolha no painel do add-on", flush=True)
+        self._auto_scan = result
 
     def run_forever(self):
         while True:
             started = time.time()
             self.poll_once()
+            try:
+                self._maybe_auto_discover()
+            except Exception as exc:  # noqa: BLE001
+                print("[busca] falhou: %s" % exc, flush=True)
             time.sleep(max(0.5, self.interval - (time.time() - started)))
 
     def snapshot(self):
         with self._lock:
             data, fetched, error = self._data, self._fetched_at, self._last_error
-            host, fetch_ms = self.host, self._fetch_ms
+            host, fetch_ms, hint = self.host, self._fetch_ms, self._last_hint
+            failures, auto_scan = self._failures, self._auto_scan
         age = None if fetched is None else round(time.time() - fetched, 1)
         meta = {
             "dtu_host": host,
@@ -299,6 +503,10 @@ class Collector:
             # leitura velha: o DTU nao respondeu nas ultimas 3 tentativas
             "stale": age is None or age > self.interval * 3 + self.timeout,
             "last_error": error,
+            "last_error_hint": hint,
+            "consecutive_failures": failures,
+            "auto_discover": self.auto_discover,
+            "last_auto_scan": auto_scan,
         }
         return data, meta
 
@@ -312,6 +520,7 @@ ENDPOINTS = {
     "/api/inverters": "paineis agrupados por microinversor",
     "/api/config": "GET: configuracao atual | POST {\"dtu_host\": \"...\"}: troca o IP do DTU",
     "/api/refresh": "POST: le o DTU agora e devolve a leitura (para testes)",
+    "/api/discover": "POST: procura DTUs na rede do Home Assistant (~5-15 s)",
     "/health": "estado do coletor",
 }
 
@@ -369,6 +578,14 @@ PAGE_HTML = r"""<!doctype html>
            font-weight:400; }
   .msg { margin-top:12px; min-height:1.4em; }
   .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  .alert { border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 8%, var(--card));
+           border-radius:12px; padding:14px 16px; margin-bottom:16px; }
+  .alert b { color:var(--bad); }
+  .alert p { margin:4px 0 10px; }
+  .found { display:flex; gap:12px; align-items:center; justify-content:space-between;
+           flex-wrap:wrap; padding:10px 0; border-top:1px solid var(--line); }
+  .found:first-child { border-top:0; }
+  .found code { font-size:15px; font-weight:600; }
   .muted { color:var(--muted); } .small { font-size:13px; }
   .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px;
                 background:var(--card); }
@@ -412,6 +629,11 @@ PAGE_HTML = r"""<!doctype html>
 
   <!-- Coleta -->
   <section data-panel="coleta">
+    <div class="alert" id="alert" hidden>
+      <b>O add-on não está conseguindo ler o DTU em <span id="a-host"></span></b>
+      <p id="a-hint"></p>
+      <button id="a-scan">Procurar DTU na rede</button>
+    </div>
     <div class="tiles">
       <div class="tile"><div class="k">Potência agora</div><div class="v" id="t-power">—</div></div>
       <div class="tile"><div class="k">Energia hoje</div><div class="v" id="t-today">—</div></div>
@@ -427,6 +649,7 @@ PAGE_HTML = r"""<!doctype html>
         <dt>Intervalo</dt><dd id="interval">…</dd>
         <dt>Nuvem Hoymiles</dt><dd id="cloud">…</dd>
         <dt>Último erro</dt><dd id="lasterr">…</dd>
+        <dt>Busca automática</dt><dd id="autoscan">…</dd>
       </dl>
     </div>
     <p class="muted small">Atualiza sozinho a cada 5 s. À noite os painéis ficam offline e
@@ -475,6 +698,14 @@ PAGE_HTML = r"""<!doctype html>
         Salvar mesmo se o DTU não responder nesse IP</label>
       <div class="msg" id="msg"></div>
     </form>
+    <div class="card">
+      <label>Procurar DTU na rede</label>
+      <p class="muted small" style="margin:0 0 10px">Testa todos os IPs da rede do Home
+        Assistant atrás do DTU. Leva de 5 a 15 segundos.</p>
+      <button id="scan">Procurar</button>
+      <div class="msg" id="scanmsg"></div>
+      <div id="scanres"></div>
+    </div>
     <p class="muted small" id="persist"></p>
   </section>
 </main>
@@ -512,8 +743,24 @@ function render(meta, data) {
     : "há " + fmt(meta.age_s, 1) + " s (" + new Date(meta.fetched_at).toLocaleTimeString("pt-BR") + ")";
   $("fetchms").textContent = meta.fetch_ms == null ? "—" : meta.fetch_ms + " ms";
   $("interval").textContent = "a cada " + meta.poll_interval_s + " s";
-  $("lasterr").textContent = meta.last_error || "nenhum";
+  $("lasterr").textContent = meta.last_error
+    ? (meta.last_error_hint ? meta.last_error_hint + " — " : "") + meta.last_error : "nenhum";
   $("lasterr").className = meta.last_error ? "bad" : "";
+  const failing = meta.last_error && (meta.consecutive_failures >= 2 || !data);
+  $("alert").hidden = !failing;
+  if (failing) {
+    $("a-host").textContent = meta.dtu_host;
+    $("a-hint").textContent = (meta.last_error_hint || meta.last_error) +
+      (meta.auto_discover ? ". A busca automática procura o DTU na rede depois de 3 falhas seguidas." : ".");
+  }
+  const as = meta.last_auto_scan;
+  $("autoscan").textContent = !meta.auto_discover ? "desligada (aba Configuração do add-on)"
+    : !as ? "ligada — ainda não foi necessária"
+    : "última em " + new Date(as.at).toLocaleTimeString("pt-BR") + ": " +
+      (as.switched_to ? "achou e trocou para " + as.switched_to
+       : as.found.length > 1 ? as.found.length + " DTUs encontrados — escolha na aba IP do DTU"
+       : as.found.length === 1 ? "o DTU está no mesmo IP"
+       : "nenhum DTU em " + (as.subnets.join(", ") || "nenhuma rede"));
   if (!data) return;
   const s = data.summary;
   $("t-power").innerHTML = fmt(s.p_total_kw, 2) + "<small>kW</small>";
@@ -673,7 +920,8 @@ $("form").addEventListener("submit", async (ev) => {
       msg.className = "msg bad";
       msg.textContent = r.status === 502
         ? "O DTU não respondeu em " + $("newhost").value.trim() +
-          ". Confira o IP ou marque a opção acima para salvar assim mesmo."
+          (b.reason ? ": " + b.reason : "") +
+          ". Use a busca abaixo ou marque a opção acima para salvar assim mesmo."
         : b.error;
     }
   } catch (e) {
@@ -683,6 +931,52 @@ $("form").addEventListener("submit", async (ev) => {
     refresh();
   }
 });
+
+async function setHost(host, btn) {
+  btn.disabled = true; btn.textContent = "Trocando…";
+  try {
+    const r = await getJson("api/config", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dtu_host: host }) });
+    btn.textContent = r.status === 200 ? "Em uso ✓" : "Falhou";
+    if (r.status === 200) { $("newhost").value = host; refresh(); }
+  } catch (e) { btn.textContent = "Falhou"; btn.disabled = false; }
+}
+async function scan() {
+  const b = $("scan"), msg = $("scanmsg"), res = $("scanres");
+  b.disabled = true; b.textContent = "Procurando…";
+  msg.className = "msg muted"; msg.textContent = "Testando os IPs da rede…"; res.textContent = "";
+  try {
+    const r = (await getJson("api/discover", { method: "POST" })).body;
+    const nets = r.subnets.join(", ") || "nenhuma rede encontrada";
+    if (!r.found.length) {
+      msg.className = "msg bad";
+      msg.textContent = "Nenhum DTU encontrado em " + nets + " (" + r.scanned + " IPs, " +
+        r.elapsed_s + " s). Confira se o DTU está ligado e no mesmo Wi-Fi/rede do Home Assistant.";
+    } else {
+      msg.className = "msg ok";
+      msg.textContent = (r.found.length === 1 ? "1 DTU encontrado" : r.found.length + " DTUs encontrados") +
+        " em " + nets + " (" + r.elapsed_s + " s).";
+    }
+    for (const f of r.found) {
+      const row = document.createElement("div"); row.className = "found";
+      const info = document.createElement("div");
+      const code = document.createElement("code"); code.textContent = f.host;
+      const det = document.createElement("div"); det.className = "muted small";
+      det.textContent = f.panel_count + " painéis · " + fmt(f.p_total_kw, 2) + " kW agora · " +
+        fmt(f.e_total_kwh, 0) + " kWh total";
+      info.append(code, det);
+      const use = document.createElement("button");
+      const current = cfg && f.host === $("host").textContent;
+      use.textContent = current ? "Em uso" : "Usar este IP"; use.disabled = current;
+      use.addEventListener("click", () => setHost(f.host, use));
+      row.append(info, use); res.append(row);
+    }
+  } catch (e) {
+    msg.className = "msg bad"; msg.textContent = "Falha na busca: " + e;
+  } finally { b.disabled = false; b.textContent = "Procurar"; }
+}
+$("scan").addEventListener("click", scan);
+$("a-scan").addEventListener("click", () => { showTab("ip"); scan(); });
 
 loadConfig().catch(() => {}); refresh(); setInterval(refresh, 5000);
 </script>
@@ -767,6 +1061,8 @@ def make_handler(collector):
             return self._send(404, {"error": "rota nao encontrada", "endpoints": ENDPOINTS})
 
         def do_POST(self):
+            if self._path() == "/api/discover":
+                return self._send(200, scan_for_dtus(collector.host, collector.timeout))
             if self._path() == "/api/refresh":
                 collector.poll_once()
                 data, meta = collector.snapshot()
@@ -794,15 +1090,17 @@ def make_handler(collector):
 
             with config_lock:
                 # testa o novo endereco antes de trocar, para nao perder a coleta por um IP errado
-                data, test_error = None, None
+                data, test_error, test_hint = None, None, None
                 try:
-                    data = parse_hometable(fetch_hometable(host, collector.timeout))
+                    data = parse_dtu(fetch_hometable(host, collector.timeout))
                 except Exception as exc:  # noqa: BLE001
                     test_error = "%s: %s" % (type(exc).__name__, exc)
+                    test_hint = explain_error(exc, collector.timeout)
                 if test_error and not force:
                     return self._send(502, {
                         "error": "o DTU nao respondeu em %s" % host,
                         "detail": test_error,
+                        "reason": test_hint,
                         "hint": "envie \"force\": true para trocar mesmo assim",
                     })
                 collector.set_host(host, data)
@@ -826,11 +1124,13 @@ def make_handler(collector):
 
 def main():
     opts = load_options()
-    collector = Collector(opts["dtu_host"], opts["poll_interval"], opts["timeout"])
+    collector = Collector(opts["dtu_host"], opts["poll_interval"], opts["timeout"],
+                          opts.get("auto_discover", True))
     threading.Thread(target=collector.run_forever, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", opts["port"]), make_handler(collector))
-    print("[api] v%s - DTU em %s, coleta a cada %ss, ouvindo na porta %s"
-          % (VERSION, opts["dtu_host"], collector.interval, opts["port"]), flush=True)
+    print("[api] v%s - DTU em %s, coleta a cada %ss, busca automatica %s, porta %s"
+          % (VERSION, opts["dtu_host"], collector.interval,
+             "ligada" if collector.auto_discover else "desligada", opts["port"]), flush=True)
     server.serve_forever()
 
 

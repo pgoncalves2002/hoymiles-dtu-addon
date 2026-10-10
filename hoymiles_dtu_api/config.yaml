@@ -1,5 +1,5 @@
 name: Hoymiles DTU API
-version: "1.1.0"
+version: "1.2.0"
 slug: hoymiles_dtu_api
 description: Captura os dados do DTU Hoymiles na rede local e os expõe em uma API REST (JSON)
 arch:
@@ -24,7 +24,9 @@ options:
   dtu_host: "192.168.0.34"
   poll_interval: 5
   timeout: 5
+  auto_discover: true
 schema:
   dtu_host: str
   poll_interval: int(2,3600)
   timeout: int(1,60)
+  auto_discover: bool
