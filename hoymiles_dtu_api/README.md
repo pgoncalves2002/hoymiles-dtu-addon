@@ -43,8 +43,58 @@ O mesmo painel abre em `http://<ip-do-home-assistant>:8099/` no navegador.
 | `poll_interval` | `5`            | Segundos entre leituras do DTU              |
 | `timeout`       | `5`            | Tempo máximo de espera pela resposta do DTU |
 | `auto_discover` | `true`         | Se o DTU parar de responder, procura na rede e troca de IP sozinho |
+| `mqtt_enabled`  | `true`         | Publica os sensores no MQTT do Home Assistant (veja abaixo) |
+| `mqtt_host` etc.| —              | Opcionais: broker manual (`mqtt_host`, `mqtt_port`, `mqtt_user`, `mqtt_password`). Vazios = usa o Mosquitto do HA |
 
 A porta externa (8099) pode ser trocada na seção **Rede** do add-on.
+
+## Sensores no Home Assistant (MQTT) e painel Energia
+
+O add-on publica as leituras no broker MQTT com **MQTT Discovery**: os sensores
+aparecem sozinhos, sem YAML.
+
+**Pré-requisitos** (uma vez só):
+
+1. Add-on **Mosquitto broker** instalado e iniciado.
+2. Integração **MQTT** configurada (o HA costuma oferecer em
+   **Configurações → Dispositivos e serviços** depois que o Mosquitto sobe).
+
+O add-on acha o Mosquitto sozinho pelo Supervisor. Para outro broker, preencha
+`mqtt_host` (e usuário/senha) na aba **Configuração**.
+
+**O que aparece** em **Configurações → Dispositivos e serviços → MQTT**:
+
+- Dispositivo **DTU Hoymiles**: Potência (W), **Energia total** (kWh),
+  Energia hoje (kWh), CO₂ evitado (kg) e Painéis online.
+- Um dispositivo **Microinversor &lt;serial&gt;** para cada microinversor:
+  Potência, Energia hoje, Temperatura e, para cada painel, potência e
+  energia do dia.
+
+**Para a geração aparecer no painel Energia:**
+
+1. **Configurações → Painéis → Energia** (ou abra o painel **Energia** e
+   clique para configurar).
+2. Em **Produção solar**, clique em **Adicionar geração solar**.
+3. Escolha o sensor **DTU Hoymiles Energia total**
+   (`sensor.hoymiles_dtu_energy_total`) e salve.
+
+O painel Energia começa a contar a partir daí (não importa o histórico
+anterior) e mostra os dados por hora; a primeira barra aparece depois de
+cerca de uma hora.
+
+Detalhes:
+
+- Use **Energia total**, não "Energia hoje": é o contador acumulado do DTU, o
+  formato que o painel Energia espera (`total_increasing`).
+- O add-on nunca publica uma energia total menor que a maior já publicada. Se
+  o DTU mandar 0 ou um valor menor por engano, o painel Energia não conta
+  a geração em dobro quando o valor voltar.
+- O estado só é publicado quando os dados mudam, para não encher o banco do
+  HA.
+- Se o DTU parar de responder, os sensores ficam **indisponíveis** em vez de
+  mostrar um valor velho. À noite eles continuam disponíveis, com potência 0.
+- A aba **Coleta** do painel mostra se o MQTT está conectado e quantos sensores
+  foram publicados.
 
 ## Trocar o IP do DTU pelo Home Assistant
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0
+
+- Sensores no Home Assistant via MQTT Discovery, usando o Mosquitto do HA
+  automaticamente: potência, energia total/hoje, CO₂, painéis online e um
+  dispositivo por microinversor (com potência e energia de cada painel).
+- **Energia total** pronta para o painel Energia (`total_increasing`), com
+  proteção contra quedas do total vindas do DTU.
+- Sensores indisponíveis quando o DTU não responde.
+- Status do MQTT na aba Coleta. Novas opções `mqtt_enabled` e `mqtt_*`.
+
 ## 1.2.0
 
 - Busca do DTU na rede: botão **Procurar** no painel e `POST /api/discover`.

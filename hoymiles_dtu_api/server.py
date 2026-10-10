@@ -29,12 +29,13 @@ OPTIONS_FILE = "/data/options.json"  # gerado pelo Home Assistant Supervisor
 SUPERVISOR_OPTIONS_URL = "http://supervisor/addons/self/options"
 SUPERVISOR_INFO_URL = "http://supervisor/addons/self/info"
 SUPERVISOR_NETWORK_URL = "http://supervisor/network/info"
+SUPERVISOR_MQTT_URL = "http://supervisor/services/mqtt"
 # redes internas do Supervisor/Docker: nunca entram na busca
 INTERNAL_NETS = [ipaddress.ip_network(n) for n in ("172.30.32.0/23", "172.30.232.0/23")]
 AUTO_SCAN_EVERY = 600  # s entre buscas automaticas enquanto o DTU nao responde
 HEADER_FIELDS = 12                   # campos antes da lista de paineis
 ROW_FIELDS = 8                       # campos por painel
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # IP ou nome na rede, com porta opcional: 192.168.0.34 | dtu.lan | 192.168.0.34:8080
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$")
 
@@ -42,7 +43,7 @@ HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?(?::\d{1
 # ----------------------------------------------------------------- config --
 def load_options():
     opts = {"dtu_host": "192.168.0.34", "poll_interval": 5, "timeout": 5,
-            "auto_discover": True}
+            "auto_discover": True, "mqtt_enabled": True}
     try:
         with open(OPTIONS_FILE, encoding="utf-8") as fh:
             opts.update(json.load(fh))
@@ -55,6 +56,11 @@ def load_options():
         opts["poll_interval"] = int(os.environ["POLL_INTERVAL"])
     if os.environ.get("TIMEOUT"):
         opts["timeout"] = int(os.environ["TIMEOUT"])
+    for key in ("MQTT_HOST", "MQTT_PORT", "MQTT_USER", "MQTT_PASSWORD"):
+        if os.environ.get(key):
+            opts[key.lower()] = os.environ[key]
+    if os.environ.get("MQTT_ENABLED"):
+        opts["mqtt_enabled"] = os.environ["MQTT_ENABLED"].lower() in ("1", "true", "sim", "yes")
     if os.environ.get("AUTO_DISCOVER"):
         opts["auto_discover"] = os.environ["AUTO_DISCOVER"].lower() in ("1", "true", "sim", "yes")
     opts["port"] = int(os.environ.get("PORT", 8099))
@@ -382,8 +388,11 @@ def scan_for_dtus(current_host, timeout):
 
 # ------------------------------------------------------------------ coletor --
 class Collector:
-    def __init__(self, host, interval, timeout, auto_discover=True):
+    def __init__(self, host, interval, timeout, auto_discover=True, extra_options=None):
         self.host = host
+        # demais opcoes do add-on (mqtt_*): reenviadas ao salvar, senao o Supervisor as apaga
+        self.extra_options = dict(extra_options or {})
+        self.mqtt = None  # MqttBridge, quando ligado
         self.interval = max(1, int(interval))
         self.timeout = int(timeout)
         self.auto_discover = bool(auto_discover)
@@ -404,7 +413,8 @@ class Collector:
 
     def options(self):
         """Opcoes no formato do schema do add-on (config.yaml)."""
-        return {"dtu_host": self.host, "poll_interval": self.interval,
+        return {**self.extra_options,
+                "dtu_host": self.host, "poll_interval": self.interval,
                 "timeout": self.timeout, "auto_discover": self.auto_discover}
 
     def set_host(self, host, data=None):
@@ -507,8 +517,301 @@ class Collector:
             "consecutive_failures": failures,
             "auto_discover": self.auto_discover,
             "last_auto_scan": auto_scan,
+            "mqtt": self.mqtt.status() if self.mqtt else None,
         }
         return data, meta
+
+
+# -------------------------------------------------------------------- mqtt --
+# Publica as leituras no broker MQTT com MQTT Discovery do Home Assistant: os
+# sensores aparecem sozinhos (dispositivo "DTU Hoymiles" + um por
+# microinversor) e "Energia total" pode ser usada no painel Energia.
+MQTT_BASE = "hoymiles_dtu"
+MQTT_STATE = MQTT_BASE + "/state"
+MQTT_AVAIL = MQTT_BASE + "/availability"
+MQTT_DISCOVERY = "homeassistant"
+MQTT_STATE_FILE = "/data/mqtt_state.json"  # maior energia total ja publicada
+
+try:
+    import paho.mqtt.client as paho_mqtt
+except ImportError:  # fora do container do add-on, sem paho-mqtt instalado
+    paho_mqtt = None
+
+
+def _r(value, digits):
+    return None if value is None else round(value, digits)
+
+
+class MqttBridge:
+    def __init__(self, collector, options):
+        self.collector = collector
+        self.enabled = bool(options.get("mqtt_enabled", True))
+        self.manual = {k: options.get(k) for k in
+                       ("mqtt_host", "mqtt_port", "mqtt_user", "mqtt_password")}
+        self.state_file = MQTT_STATE_FILE
+        self._client = None
+        self._lock = threading.Lock()
+        self._connected = False
+        self._broker = None
+        self._error = None
+        self._published = {}       # topico -> payload ja publicado (evita repetir)
+        self._entities = 0
+        self._last_state_at = None
+        self._energy_max = self._load_energy_max()
+        self._drop_logged = None
+
+    # ----------------------------------------------------------- estado --
+    def status(self):
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "connected": self._connected,
+                "broker": self._broker,
+                "error": self._error,
+                "entities": self._entities,
+                "last_publish": self._last_state_at,
+            }
+
+    def _set(self, **kw):
+        with self._lock:
+            for k, v in kw.items():
+                setattr(self, "_" + k, v)
+
+    def _load_energy_max(self):
+        try:
+            with open(self.state_file, encoding="utf-8") as fh:
+                return float(json.load(fh).get("energy_total_kwh") or 0)
+        except (OSError, ValueError):
+            return 0.0
+
+    def _save_energy_max(self):
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as fh:
+                json.dump({"energy_total_kwh": self._energy_max}, fh)
+        except OSError:
+            pass  # fora do HA nao ha /data: so perde a protecao apos reiniciar
+
+    # ---------------------------------------------------------- conexao --
+    def _broker_settings(self):
+        """Broker manual (opcoes mqtt_*) ou o Mosquitto do HA, via Supervisor."""
+        if self.manual.get("mqtt_host"):
+            return {"host": self.manual["mqtt_host"],
+                    "port": int(self.manual.get("mqtt_port") or 1883),
+                    "username": self.manual.get("mqtt_user"),
+                    "password": self.manual.get("mqtt_password"), "ssl": False}
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            raise RuntimeError("sem Supervisor: preencha mqtt_host para usar MQTT")
+        req = urllib.request.Request(SUPERVISOR_MQTT_URL,
+                                     headers={"Authorization": "Bearer " + token})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read()).get("data") or {}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 404):
+                raise RuntimeError("nenhum broker MQTT no Home Assistant: instale o "
+                                   "add-on Mosquitto broker (ou preencha mqtt_host)")
+            raise
+        if not data.get("host"):
+            raise RuntimeError("o Supervisor nao informou o broker MQTT")
+        return data
+
+    def start(self):
+        if not self.enabled:
+            print("[mqtt] desligado nas opcoes", flush=True)
+            return
+        if paho_mqtt is None:
+            self._set(error="biblioteca paho-mqtt ausente")
+            print("[mqtt] paho-mqtt nao instalado; MQTT desligado", flush=True)
+            return
+        threading.Thread(target=self._run, daemon=True, name="mqtt").start()
+
+    def _run(self):
+        # descobre o broker (tenta de novo ate o Mosquitto subir)
+        while True:
+            try:
+                cfg = self._broker_settings()
+                break
+            except Exception as exc:  # noqa: BLE001
+                self._set(error=str(exc))
+                print("[mqtt] %s; tentando de novo em 60 s" % exc, flush=True)
+                time.sleep(60)
+        self._set(broker="%s:%s" % (cfg["host"], cfg["port"]))
+        client = paho_mqtt.Client(paho_mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id="hoymiles-dtu-api")
+        if cfg.get("username"):
+            client.username_pw_set(cfg["username"], cfg.get("password"))
+        if cfg.get("ssl"):
+            client.tls_set()
+        client.will_set(MQTT_AVAIL, "offline", qos=1, retain=True)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        client.reconnect_delay_set(min_delay=2, max_delay=60)
+        self._client = client
+        client.connect_async(cfg["host"], int(cfg["port"]), keepalive=60)
+        client.loop_start()
+        print("[mqtt] conectando em %s:%s" % (cfg["host"], cfg["port"]), flush=True)
+        while True:
+            try:
+                self.publish()
+            except Exception as exc:  # noqa: BLE001
+                print("[mqtt] falha ao publicar: %s" % exc, flush=True)
+            time.sleep(self.collector.interval)
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code.is_failure:
+            self._set(connected=False, error="broker recusou: %s" % reason_code)
+            print("[mqtt] broker recusou a conexao: %s" % reason_code, flush=True)
+            return
+        self._set(connected=True, error=None)
+        print("[mqtt] conectado", flush=True)
+        client.subscribe(MQTT_DISCOVERY + "/status")
+        with self._lock:
+            self._published.clear()  # republica tudo apos (re)conectar
+        threading.Thread(target=self.publish, daemon=True).start()
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self._set(connected=False)
+        if reason_code.is_failure:
+            self._set(error="desconectado: %s" % reason_code)
+            print("[mqtt] desconectado: %s" % reason_code, flush=True)
+
+    def _on_message(self, client, userdata, msg):
+        # o HA reiniciou: manda de novo discovery e estado
+        if msg.topic == MQTT_DISCOVERY + "/status" and msg.payload == b"online":
+            with self._lock:
+                self._published.clear()
+            threading.Thread(target=self.publish, daemon=True).start()
+
+    def _send(self, topic, payload, retain=True):
+        with self._lock:
+            if self._published.get(topic) == payload:
+                return
+        info = self._client.publish(topic, payload, qos=1, retain=retain)
+        if info.rc == paho_mqtt.MQTT_ERR_SUCCESS:
+            with self._lock:
+                self._published[topic] = payload
+
+    # ------------------------------------------------------- publicacao --
+    def build_state(self, data):
+        s = data["summary"]
+        panel_sum = sum(p["p_grid"] or 0 for p in data["panels"])
+        power_w = round(panel_sum, 1) if data["panels"] else _r(
+            None if s["p_total_kw"] is None else s["p_total_kw"] * 1000, 1)
+        total = s["e_total_kwh"]
+        if total is not None and total > 0:
+            if total < self._energy_max:
+                # o painel Energia conta qualquer queda como "zerou" e somaria tudo de
+                # novo na volta: nunca publica um total menor que o ja publicado
+                if total != self._drop_logged:
+                    self._drop_logged = total
+                    print("[mqtt] energia total do DTU caiu (%.2f < %.2f); mantendo a maior"
+                          % (total, self._energy_max), flush=True)
+                total = self._energy_max
+            elif total > self._energy_max:
+                self._energy_max = total
+                self._save_energy_max()
+        else:
+            total = self._energy_max or None  # 0/vazio do DTU nao entra
+        return {
+            "power_w": power_w,
+            "energy_total_kwh": total,
+            "energy_today_kwh": s["e_today_kwh"],
+            "co2_saved_kg": s["co2_saved_kg"],
+            "panels_online": s["panels_online"],
+            "panel_count": s["panel_count"],
+            "inv": {i["serial"]: {
+                "power_w": i["p_grid"],
+                "energy_today_wh": i["e_today_wh"],
+                "temperature": i["temperature"] if i["online"] else None,
+            } for i in data["inverters"]},
+            "pnl": {p["id"]: {
+                "power_w": p["p_grid"],
+                "energy_today_wh": p["e_today_wh"],
+            } for p in data["panels"]},
+        }
+
+    def discovery(self, data):
+        """Mensagens de configuracao do MQTT Discovery: [(topico, payload)]."""
+        dtu_dev = {"identifiers": [MQTT_BASE], "name": "DTU Hoymiles",
+                   "manufacturer": "Hoymiles", "model": "DTU",
+                   "sw_version": "add-on " + VERSION}
+        origin = {"name": "Hoymiles DTU API", "sw_version": VERSION}
+        out = []
+
+        def sensor(uid, name, template, device, unit=None, device_class=None,
+                   state_class=None, precision=None, icon=None, category=None):
+            cfg = {"name": name, "unique_id": uid, "default_entity_id": "sensor." + uid,
+                   "state_topic": MQTT_STATE, "value_template": template,
+                   "availability_topic": MQTT_AVAIL, "device": device, "origin": origin}
+            for key, val in (("unit_of_measurement", unit), ("device_class", device_class),
+                             ("state_class", state_class), ("icon", icon),
+                             ("suggested_display_precision", precision),
+                             ("entity_category", category)):
+                if val is not None:
+                    cfg[key] = val
+            out.append(("%s/sensor/%s/%s/config" % (MQTT_DISCOVERY, MQTT_BASE, uid),
+                        json.dumps(cfg, ensure_ascii=False, separators=(",", ":"))))
+
+        sensor("hoymiles_dtu_power", "Potência", "{{ value_json.power_w }}", dtu_dev,
+               "W", "power", "measurement", 0)
+        sensor("hoymiles_dtu_energy_total", "Energia total",
+               "{{ value_json.energy_total_kwh }}", dtu_dev,
+               "kWh", "energy", "total_increasing", 2)
+        sensor("hoymiles_dtu_energy_today", "Energia hoje",
+               "{{ value_json.energy_today_kwh }}", dtu_dev,
+               "kWh", "energy", "total_increasing", 2)
+        sensor("hoymiles_dtu_co2_saved", "CO₂ evitado", "{{ value_json.co2_saved_kg }}",
+               dtu_dev, "kg", None, "total_increasing", 1, "mdi:molecule-co2")
+        sensor("hoymiles_dtu_panels_online", "Painéis online",
+               "{{ value_json.panels_online }}", dtu_dev, None, None, "measurement",
+               0, "mdi:solar-panel", "diagnostic")
+
+        for inv in data["inverters"]:
+            serial = inv["serial"]
+            dev = {"identifiers": ["%s_%s" % (MQTT_BASE, serial)],
+                   "name": "Microinversor %s" % serial, "manufacturer": "Hoymiles",
+                   "model": "Microinversor", "serial_number": serial,
+                   "via_device": MQTT_BASE}
+            base = "{{ value_json.inv['%s']" % serial
+            uid = "hoymiles_%s" % serial
+            sensor(uid + "_power", "Potência", base + ".power_w }}", dev,
+                   "W", "power", "measurement", 0)
+            sensor(uid + "_energy_today", "Energia hoje", base + ".energy_today_wh }}", dev,
+                   "Wh", "energy", "total_increasing", 0)
+            sensor(uid + "_temperature", "Temperatura", base + ".temperature }}", dev,
+                   "°C", "temperature", "measurement", 1)
+            for pid in inv["panels"]:
+                port = pid.partition("-")[2] or pid
+                pbase = "{{ value_json.pnl['%s']" % pid
+                puid = "hoymiles_%s" % pid.replace("-", "_")
+                sensor(puid + "_power", "Painel %s potência" % port,
+                       pbase + ".power_w }}", dev, "W", "power", "measurement", 0)
+                sensor(puid + "_energy_today", "Painel %s energia hoje" % port,
+                       pbase + ".energy_today_wh }}", dev,
+                       "Wh", "energy", "total_increasing", 0)
+        return out
+
+    def publish(self):
+        if self._client is None or not self.status()["connected"]:
+            return
+        data, meta = self.collector.snapshot()
+        if data is None:
+            self._send(MQTT_AVAIL, "offline")
+            return
+        configs = self.discovery(data)
+        for topic, payload in configs:
+            self._send(topic, payload)
+        self._set(entities=len(configs))
+        state = json.dumps(self.build_state(data), ensure_ascii=False,
+                           separators=(",", ":"))
+        before = self._published.get(MQTT_STATE)
+        self._send(MQTT_STATE, state)
+        if before != state:
+            self._set(last_state_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        # DTU sem responder: sensores ficam "indisponivel" em vez de valor velho
+        self._send(MQTT_AVAIL, "offline" if meta["stale"] else "online")
 
 
 # --------------------------------------------------------------------- API --
@@ -650,6 +953,7 @@ PAGE_HTML = r"""<!doctype html>
         <dt>Nuvem Hoymiles</dt><dd id="cloud">…</dd>
         <dt>Último erro</dt><dd id="lasterr">…</dd>
         <dt>Busca automática</dt><dd id="autoscan">…</dd>
+        <dt>MQTT</dt><dd id="mqtt">…</dd>
       </dl>
     </div>
     <p class="muted small">Atualiza sozinho a cada 5 s. À noite os painéis ficam offline e
@@ -753,6 +1057,12 @@ function render(meta, data) {
     $("a-hint").textContent = (meta.last_error_hint || meta.last_error) +
       (meta.auto_discover ? ". A busca automática procura o DTU na rede depois de 3 falhas seguidas." : ".");
   }
+  const mq = meta.mqtt;
+  $("mqtt").className = mq && mq.enabled && !mq.connected ? "bad" : "";
+  $("mqtt").textContent = !mq || !mq.enabled ? "desligado (aba Configuração do add-on)"
+    : mq.connected ? "conectado a " + mq.broker + " · " + mq.entities + " sensores no Home Assistant" +
+      (mq.last_publish ? " · último envio " + new Date(mq.last_publish).toLocaleTimeString("pt-BR") : "")
+    : (mq.error || "conectando…") + (mq.broker ? " (" + mq.broker + ")" : "");
   const as = meta.last_auto_scan;
   $("autoscan").textContent = !meta.auto_discover ? "desligada (aba Configuração do add-on)"
     : !as ? "ligada — ainda não foi necessária"
@@ -1124,9 +1434,13 @@ def make_handler(collector):
 
 def main():
     opts = load_options()
+    core = ("dtu_host", "poll_interval", "timeout", "auto_discover", "port")
     collector = Collector(opts["dtu_host"], opts["poll_interval"], opts["timeout"],
-                          opts.get("auto_discover", True))
+                          opts.get("auto_discover", True),
+                          {k: v for k, v in opts.items() if k not in core})
+    collector.mqtt = MqttBridge(collector, opts)
     threading.Thread(target=collector.run_forever, daemon=True).start()
+    collector.mqtt.start()
     server = ThreadingHTTPServer(("0.0.0.0", opts["port"]), make_handler(collector))
     print("[api] v%s - DTU em %s, coleta a cada %ss, busca automatica %s, porta %s"
           % (VERSION, opts["dtu_host"], collector.interval,
